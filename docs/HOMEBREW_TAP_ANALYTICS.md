@@ -4,84 +4,52 @@
 tap repo. GitHub exposes 14 days of clone history per repo via
 `/repos/{owner}/{tap}/traffic/clones`, after which the data is gone.
 
-This workflow lives in the **homebrew-tap repo**
-(`ericjypark/homebrew-tap`), not in the landing repo. It runs daily,
-fetches yesterday's clone count, and pushes one PostHog event per
-unique cloner so the data is preserved in PostHog Insights alongside
-DMG-download events from the landing page.
+The workflow at
+[`ericjypark/homebrew-tap/.github/workflows/clones-to-posthog.yml`](https://github.com/ericjypark/homebrew-tap/blob/main/.github/workflows/clones-to-posthog.yml)
+runs daily at 02:17 UTC, fetches yesterday's clone row, and pushes a
+single `homebrew_tap_daily` event to PostHog. Backfill mode
+(`workflow_dispatch` with `backfill=true`) walks all 14 days currently
+in the API. Idempotent via `$insert_id`.
 
-## One-time setup
+## Status
 
-1. In `ericjypark/homebrew-tap`, add two repository secrets:
-   - `POSTHOG_KEY` — same project key the landing site uses
-     (`NEXT_PUBLIC_POSTHOG_KEY`)
-   - `POSTHOG_HOST` — `https://us.i.posthog.com` (or the EU host)
-2. Add the workflow file below at
-   `.github/workflows/clones-to-posthog.yml`.
-3. Trigger manually once via the Actions tab to confirm a
-   `homebrew_tap_cloned` event lands in PostHog.
+- ✅ Workflow committed and active.
+- ✅ `POSTHOG_KEY` + `POSTHOG_HOST` secrets set on the tap repo.
+- ✅ Initial 14-day backfill completed (2026-04-30 → 2026-05-03 had
+  non-zero traffic and is now in PostHog).
+- ⚠️ **`TRAFFIC_TOKEN` secret NOT yet set** — the daily cron will
+  fail until this is added. See "Why a separate token" below.
 
-## Workflow
+## Why a separate token
 
-```yaml
-name: Push Homebrew tap clone stats to PostHog
+GitHub Actions' built-in `GITHUB_TOKEN` cannot read the traffic API.
+Traffic data requires the fine-grained permission **Administration:
+Read**, which is not in the list of scopes available to
+`GITHUB_TOKEN` in workflow YAML
+(`actions/checks/contents/deployments/.../statuses` only).
 
-on:
-  schedule:
-    - cron: "17 2 * * *" # 02:17 UTC daily — well after midnight everywhere
-  workflow_dispatch: {}
+So the workflow needs a fine-grained PAT exposed as `TRAFFIC_TOKEN`.
 
-permissions:
-  contents: read
+## Adding TRAFFIC_TOKEN (one-time, ~2 min)
 
-jobs:
-  push:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fetch clone stats and push to PostHog
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          POSTHOG_KEY: ${{ secrets.POSTHOG_KEY }}
-          POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
-        run: |
-          set -euo pipefail
-          repo="${GITHUB_REPOSITORY}"
-          yesterday=$(date -u -d 'yesterday' +%Y-%m-%dT00:00:00Z)
-          payload=$(gh api "repos/${repo}/traffic/clones" \
-            --jq --arg ts "$yesterday" \
-              '.clones[] | select(.timestamp == $ts)')
-          if [ -z "$payload" ]; then
-            echo "No clone data for $yesterday yet — exiting cleanly."
-            exit 0
-          fi
-          count=$(echo "$payload" | jq '.count')
-          uniques=$(echo "$payload" | jq '.uniques')
-          for i in $(seq 1 "$count"); do
-            curl -fsS -X POST "${POSTHOG_HOST}/i/v0/e/" \
-              -H "content-type: application/json" \
-              -d "$(jq -n \
-                --arg key "$POSTHOG_KEY" \
-                --arg ts "$yesterday" \
-                --arg repo "$repo" \
-                --argjson count "$count" \
-                --argjson uniques "$uniques" \
-                '{
-                  api_key: $key,
-                  event: "homebrew_tap_cloned",
-                  distinct_id: ("homebrew-cloner-" + $ts + "-" + (now|tostring)),
-                  timestamp: $ts,
-                  properties: {
-                    surface_app: "homebrew_tap",
-                    tap_repo: $repo,
-                    day: $ts,
-                    day_clone_count: $count,
-                    day_unique_count: $uniques,
-                    "$lib": "homebrew-tap-cron"
-                  }
-                }')"
-          done
-          echo "Pushed $count clone events for $yesterday."
-```
+1. Open <https://github.com/settings/personal-access-tokens/new>
+2. Configure:
+   - **Token name**: `homebrew-tap traffic stats`
+   - **Expiration**: 1 year (mark calendar to renew)
+   - **Repository access**: "Only select repositories" → `ericjypark/homebrew-tap`
+   - **Permissions** → Repository permissions:
+     - **Administration: Read-only**
+     - (everything else stays "No access")
+3. Click **Generate token** and copy the value.
+4. Set as a secret on the tap repo:
+   ```sh
+   gh secret set TRAFFIC_TOKEN --repo ericjypark/homebrew-tap --body 'github_pat_...'
+   ```
+5. Trigger to verify:
+   ```sh
+   gh workflow run clones-to-posthog.yml --repo ericjypark/homebrew-tap -f backfill=true
+   gh run watch "$(gh run list --repo ericjypark/homebrew-tap --workflow=clones-to-posthog.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status --repo ericjypark/homebrew-tap
+   ```
 
 ## Caveats
 
@@ -89,9 +57,9 @@ jobs:
   `brew update`s daily, they show up every day. Treat
   `day_unique_count` as the more honest signal — it's the number of
   unique IPs that hit the tap that day.
-- **GitHub returns at most 14 days of history.** This cron preserves
-  the data going forward, but **anything older than today minus 14 is
-  permanently gone**. Backfill what you can from the current
-  `traffic/clones` response on first run if you care.
-- Run the cron manually once a day for a week to confirm it doesn't
-  double-count, then leave it alone.
+- **GitHub returns at most 14 days of history.** The cron preserves
+  data going forward, but anything older than `today - 14` is
+  permanently gone unless already captured.
+- The first cron run after setup will only see the last 24h. Re-run
+  with `backfill=true` once after enabling to grab the trailing 14
+  days too.
