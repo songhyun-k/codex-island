@@ -24,11 +24,6 @@ struct IslandRootView: View {
             // with the spring for main-thread budget and showing up as
             // hover-spring jank.
             ZStack {
-                // The silhouette + halo + sweep all depend on alert
-                // severity and the LPM event predicate, so they live in
-                // GlowLayer. Hoisting them out of this body means a
-                // UsageStore/AlertEngine emission no longer re-evaluates
-                // root's overlays, gestures, or the ExpandedView branch.
                 GlowLayer(
                     isExpanded: model.state == .expanded,
                     hovering: hovering
@@ -300,20 +295,7 @@ private struct GlowLayer: View {
 
     var body: some View {
         ZStack {
-            // Default: ambient orbit runs continuously. Low-power mode
-            // restricts it to the three "glow events" — refresh, hover,
-            // or an active limit alert — so the island stays dark at
-            // rest but lights up consistently for any meaningful state
-            // change. The orbit color follows the alert severity so
-            // the entire glow (halo + sweep) reads as one consistent
-            // color when above threshold.
             LoadingSweep(
-                // Pause entirely when the window is occluded by a
-                // fullscreen app or display sleep — the user can't
-                // see it anyway, so re-shading the gradient at 30Hz
-                // is pure waste. `effectiveEnabled` also folds in
-                // macOS system Low Power Mode, so the sweep auto-
-                // pauses on battery save.
                 active: !occlusion.isOccluded
                     && (lowPower.effectiveEnabled ? glowEventActive : true),
                 tint: glowColor
@@ -339,11 +321,8 @@ private struct GlowLayer: View {
                     radius: 14, y: 0
                 )
                 .animation(.easeInOut(duration: 0.25), value: glowEventActive)
-                // Cross-fade the glow hue when severity steps cobalt →
-                // amber → red. Without this, a 79% → 80% refresh tick
-                // visibly snaps; with it, the boundary feels like a
-                // gradient. easeInOut so the transition has no harsh
-                // start or end — the color is "just there now."
+                // 0.45s cross-fade so a threshold crossing (e.g. 79%→80%)
+                // doesn't visibly snap the hue from cobalt to amber.
                 .animation(.easeInOut(duration: 0.45), value: alerts.severity)
                 .shadow(
                     color: isExpanded ? .black.opacity(0.5) : .clear,
@@ -391,8 +370,6 @@ private struct LogoOverlay: View {
 
     var body: some View {
         if let image {
-            let visible = isVisible
-            let label = providerLabel
             Image(nsImage: image)
                 .resizable()
                 .renderingMode(.template)
@@ -401,9 +378,9 @@ private struct LogoOverlay: View {
                 .frame(width: 20, height: 20)
                 .padding(provider == .claude ? .leading : .trailing, edgePadding)
                 .padding(.top, topPadding)
-                .opacity(visible ? 1 : 0.30)
-                .saturation(visible ? 1 : 0)
-                .accessibilityLabel(visible ? label : "\(label) (hidden)")
+                .opacity(isVisible ? 1 : 0.30)
+                .saturation(isVisible ? 1 : 0)
+                .accessibilityLabel(isVisible ? providerLabel : "\(providerLabel) (hidden)")
         }
     }
 
