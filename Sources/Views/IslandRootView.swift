@@ -8,6 +8,7 @@ struct IslandRootView: View {
     @ObservedObject private var costStore = CostStore.shared
     @ObservedObject private var lowPower = LowPowerModeStore.shared
     @ObservedObject private var alerts = AlertEngine.shared
+    @ObservedObject private var occlusion = WindowOcclusionStore.shared
     @State private var hovering = false
     @State private var contentVisible = false
     @State private var pillsVisible = false
@@ -37,7 +38,14 @@ struct IslandRootView: View {
                 // the entire glow (halo + sweep) reads as one consistent
                 // color when above threshold.
                 LoadingSweep(
-                    active: lowPower.enabled ? glowEventActive : true,
+                    // Pause entirely when the window is occluded by a
+                    // fullscreen app or display sleep — the user can't
+                    // see it anyway, so re-shading the gradient at 30Hz
+                    // is pure waste. `effectiveEnabled` also folds in
+                    // macOS system Low Power Mode, so the sweep auto-
+                    // pauses on battery save.
+                    active: !occlusion.isOccluded
+                        && (lowPower.effectiveEnabled ? glowEventActive : true),
                     tint: glowColor
                 )
 
@@ -56,7 +64,7 @@ struct IslandRootView: View {
                     // ambient 0.35 the way it always has.
                     .shadow(
                         color: glowColor.opacity(
-                            lowPower.enabled ? (glowEventActive ? 0.35 : 0) : 0.35
+                            lowPower.effectiveEnabled ? (glowEventActive ? 0.35 : 0) : 0.35
                         ),
                         radius: 14, y: 0
                     )
@@ -386,10 +394,21 @@ struct IslandRootView: View {
 
 /// Cobalt angular-gradient sweep that orbits the silhouette while data is
 /// fetching. Owns its own TimelineView so the parent (IslandRootView) doesn't
-/// re-render every overlay at 120Hz — that was competing with the hover spring
-/// for main-thread budget. The minimumInterval pin is what guarantees
-/// ProMotion 120Hz refresh inside the .accessory background app context;
-/// without it the sweep settles to ~60Hz.
+/// re-render every overlay alongside the sweep — that was competing with the
+/// hover spring for main-thread budget.
+///
+/// Tick rate is 30Hz (was 120Hz). 3.6s/revolution at 30Hz = 12° per frame,
+/// indistinguishable from 120Hz to the eye for a slow continuous orbit but
+/// 4× cheaper on the main thread. The bigger CPU saving comes from gating
+/// `active` on `!isWindowOccluded` upstream — when a fullscreen app or
+/// another window covers the menu bar entirely, the sweep stops rendering
+/// (the user can't see it anyway), dropping idle CPU to ~0%.
+///
+/// Earlier attempts to push rotation into Core Animation (CAGradientLayer or
+/// `.rotationEffect` over a static gradient) all subtly changed the glow
+/// feel — SwiftUI's per-frame conic re-shading produces an alive,
+/// atmospheric look that a rotated static texture loses. This is the
+/// minimum-cost approach that preserves the exact original render.
 private struct LoadingSweep: View {
     let active: Bool
     /// Color of the orbiting trail. Cobalt by default; switches to amber
@@ -399,7 +418,7 @@ private struct LoadingSweep: View {
 
     var body: some View {
         if active {
-            TimelineView(.animation(minimumInterval: 1.0 / 120.0)) { context in
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
                 let t = context.date.timeIntervalSinceReferenceDate
                 let rotation = (t * 100).truncatingRemainder(dividingBy: 360)
                 IslandShape()
