@@ -41,9 +41,11 @@ struct IslandRootView: View {
                     // Pause entirely when the window is occluded by a
                     // fullscreen app or display sleep — the user can't
                     // see it anyway, so re-shading the gradient at 30Hz
-                    // is pure waste.
+                    // is pure waste. `effectiveEnabled` also folds in
+                    // macOS system Low Power Mode, so the sweep auto-
+                    // pauses on battery save.
                     active: !occlusion.isOccluded
-                        && (lowPower.enabled ? glowEventActive : true),
+                        && (lowPower.effectiveEnabled ? glowEventActive : true),
                     tint: glowColor
                 )
 
@@ -62,7 +64,7 @@ struct IslandRootView: View {
                     // ambient 0.35 the way it always has.
                     .shadow(
                         color: glowColor.opacity(
-                            lowPower.enabled ? (glowEventActive ? 0.35 : 0) : 0.35
+                            lowPower.effectiveEnabled ? (glowEventActive ? 0.35 : 0) : 0.35
                         ),
                         radius: 14, y: 0
                     )
