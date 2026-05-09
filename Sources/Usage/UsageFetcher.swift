@@ -1,6 +1,14 @@
 import Foundation
 
 enum UsageFetcher {
+    // MARK: - Sentinels
+
+    /// Emitted as `WindowUsage.error` when the keychain token is structurally
+    /// valid but missing a scope the Claude usage endpoint now requires
+    /// (`user:profile`, added mid-2026). The UI layer matches on this exact
+    /// string to swap the error caption for an in-app re-auth button.
+    static let claudeReauthRequiredMessage = "re-login: claude /login"
+
     // MARK: - Codex
 
     /// Codex usage lives at chatgpt.com/backend-api/wham/usage and accepts
@@ -77,12 +85,14 @@ enum UsageFetcher {
     ///   2. macOS Keychain item "Claude Code-credentials" — stable across
     ///      relaunches; the access token expires after ~8h, after which
     ///      we fall through to refresh.
-    ///   3. console.anthropic.com/v1/oauth/token refresh — Anthropic
+    ///   3. platform.claude.com/v1/oauth/token refresh — Anthropic
     ///      rotates the refresh_token on every call (the response carries
     ///      a new pair). We must persist that new pair back to the keychain
     ///      via writeClaudeCreds, otherwise Claude Code itself 401s on its
     ///      next refresh because the keychain still holds the now-revoked
-    ///      old token.
+    ///      old token. (The OAuth host migrated from console.anthropic.com
+    ///      to platform.claude.com — old URL still resolves but is not the
+    ///      canonical issuer for fresh tokens.)
     static func fetchClaude() async -> AppUsage {
         var lastError = "auth required — run claude"
         // Plan tier ships in the keychain dict only — Anthropic's usage
@@ -98,6 +108,7 @@ enum UsageFetcher {
             case .success(let u):       return u
             case .rateLimited:          lastError = "rate limited"
             case .unauthorized:         break
+            case .scopeInsufficient:    lastError = claudeReauthRequiredMessage
             case .otherError(let e):    lastError = e
             }
         }
@@ -107,6 +118,10 @@ enum UsageFetcher {
             case .success(let u):       return u
             case .rateLimited:          lastError = "rate limited"
             case .unauthorized:         break
+            // Refresh hands back tokens with the same scope set, so it cannot
+            // recover from a missing-scope 403. Bail out and surface the only
+            // remediation that actually works.
+            case .scopeInsufficient:    return errorPair(claudeReauthRequiredMessage)
             case .otherError(let e):    lastError = e
             }
 
@@ -127,6 +142,7 @@ enum UsageFetcher {
                 case .success(let u):       return u
                 case .rateLimited:          lastError = "rate limited"
                 case .unauthorized:         break
+                case .scopeInsufficient:    return errorPair(claudeReauthRequiredMessage)
                 case .otherError(let e):    lastError = e
                 }
             }
@@ -139,6 +155,11 @@ enum UsageFetcher {
         case success(AppUsage)
         case rateLimited
         case unauthorized
+        /// Token is structurally valid but missing a scope the server now requires
+        /// (Anthropic added `user:profile` to /api/oauth/usage in mid-2026).
+        /// Refresh won't help — only a fresh `claude /login` re-issues with the
+        /// expanded scope set.
+        case scopeInsufficient
         case otherError(String)
     }
 
@@ -276,6 +297,7 @@ enum UsageFetcher {
                 return .otherError("bad response")
             }
             if http.statusCode == 401 { return .unauthorized }
+            if http.statusCode == 403 { return .scopeInsufficient }
             if http.statusCode == 429 { return .rateLimited }
             guard http.statusCode == 200 else {
                 return .otherError("HTTP \(http.statusCode)")
@@ -327,7 +349,7 @@ enum UsageFetcher {
     /// server and any downstream consumer (Claude Code, Claude Desktop)
     /// 401s on its next refresh.
     private static func refreshClaudeToken(refreshToken: String) async -> RefreshedTokens? {
-        var req = URLRequest(url: URL(string: "https://console.anthropic.com/v1/oauth/token")!)
+        var req = URLRequest(url: URL(string: "https://platform.claude.com/v1/oauth/token")!)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: [String: String] = [
@@ -350,5 +372,77 @@ enum UsageFetcher {
         } catch {
             return nil
         }
+    }
+
+    // MARK: - In-app re-auth
+
+    /// True only when the in-app "Re-authenticate" button can actually do
+    /// something useful: the user already has a Claude keychain item
+    /// (otherwise they're a Codex-only user — no Claude flow to re-auth) and
+    /// the `claude` binary exists at a known install path. We deliberately do
+    /// not shell out to `which`; LaunchServices gives the app a stripped PATH
+    /// (`/usr/bin:/bin:/usr/sbin:/sbin`), so a `which` call would miss every
+    /// Homebrew/nvm/Bun install and the button would silently never appear
+    /// for most users.
+    static func canPromptClaudeReauth() -> Bool {
+        guard readClaudeKeychainAccount() != nil else { return false }
+        return locateClaudeBinary() != nil
+    }
+
+    /// Detached spawn of `claude auth login`. The CLI takes care of opening
+    /// the browser, running the localhost OAuth callback listener, and
+    /// writing the rotated tokens (with the expanded scope set) back to the
+    /// `Claude Code-credentials` keychain item we read on the next refresh.
+    /// Returns false only if `claude` couldn't be located — the spawn itself
+    /// is fire-and-forget; the caller polls for the keychain update.
+    @discardableResult
+    static func spawnClaudeReauth() -> Bool {
+        guard let path = locateClaudeBinary() else { return false }
+        let task = Process()
+        task.launchPath = path
+        task.arguments = ["auth", "login"]
+        // Detach stdio: we don't want the CLI's progress output to leak into
+        // our app's stderr, and we explicitly do not want it inheriting our
+        // controlling terminal (we don't have one — we're a GUI app).
+        task.standardOutput = Pipe()
+        task.standardError = Pipe()
+        task.standardInput = Pipe()
+        do {
+            try task.run()
+            return true
+        } catch {
+            NSLog("CodexIsland: failed to spawn claude auth login: %@", error.localizedDescription)
+            return false
+        }
+    }
+
+    /// Common install locations for the Claude Code CLI, in priority order.
+    /// nvm is special-cased because its bin path embeds a node version we
+    /// can't predict. We don't probe Volta/asdf/etc.; users with exotic
+    /// installs will fall through to the manual `claude /login` path.
+    private static func locateClaudeBinary() -> String? {
+        let home = NSHomeDirectory()
+        let candidates = [
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            "\(home)/.bun/bin/claude",
+            "\(home)/.npm-global/bin/claude",
+            "\(home)/.local/bin/claude",
+        ]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+        let nvmRoot = "\(home)/.nvm/versions/node"
+        if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvmRoot) {
+            // Sort descending so the newest installed Node version wins —
+            // matches what `nvm use` would resolve to in practice.
+            for version in versions.sorted(by: >) {
+                let candidate = "\(nvmRoot)/\(version)/bin/claude"
+                if FileManager.default.isExecutableFile(atPath: candidate) {
+                    return candidate
+                }
+            }
+        }
+        return nil
     }
 }

@@ -47,15 +47,58 @@ struct ChartsBlock: View {
     let style: ChartStyle
     let seed: Int
 
+    /// Treat the block as needing re-auth when both windows are stuck on the
+    /// scope-insufficient sentinel. Either tile alone could be a transient
+    /// per-window failure, but matching pair = the underlying token genuinely
+    /// lacks the required scope.
+    private var needsReauth: Bool {
+        usage.fiveHour.error == UsageFetcher.claudeReauthRequiredMessage
+            && usage.weekly.error == UsageFetcher.claudeReauthRequiredMessage
+    }
+
     var body: some View {
-        HStack(spacing: 18) {
-            ChartTile(style: style, color: color, label: "5h",
-                      window: usage.fiveHour, seed: seed)
-            ChartTile(style: style, color: color, label: "week",
-                      window: usage.weekly, seed: seed + 1)
+        VStack(spacing: 6) {
+            HStack(spacing: 18) {
+                ChartTile(style: style, color: color, label: "5h",
+                          window: usage.fiveHour, seed: seed)
+                ChartTile(style: style, color: color, label: "week",
+                          window: usage.weekly, seed: seed + 1)
+            }
+            if needsReauth && UsageFetcher.canPromptClaudeReauth() {
+                ReauthButton()
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .padding(.horizontal, 12)
+    }
+}
+
+/// Inline action shown below the Claude tiles when the keychain token is
+/// missing the scope the usage endpoint now requires. Spawns
+/// `claude auth login` and polls for the keychain to update — the chip
+/// recovers on its own when the new scoped token lands.
+struct ReauthButton: View {
+    @ObservedObject private var store = UsageStore.shared
+    @State private var hovered = false
+
+    var body: some View {
+        Button {
+            store.reauthenticateClaude()
+        } label: {
+            Text(store.claudeReauthInProgress ? "waiting for browser…" : "Re-authenticate")
+                .font(Typography.label)
+                .foregroundStyle(.white.opacity(hovered && !store.claudeReauthInProgress ? 0.95 : 0.72))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(.white.opacity(hovered && !store.claudeReauthInProgress ? 0.08 : 0.04))
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 5))
+        }
+        .buttonStyle(.plain)
+        .disabled(store.claudeReauthInProgress)
+        .onHover { hovered = $0 }
     }
 }
 
@@ -105,7 +148,18 @@ struct ChartTile: View {
         // OAuth call lands. Hide it so the tile reads as a passive
         // window-context cue (the "5h"/"week" header label communicates the
         // window type) instead of looking broken. Real errors still surface.
-        if let err = window.error, err != "no data" { return err }
+        if let err = window.error, err != "no data" {
+            // Suppress the scope-insufficient text when the inline re-auth
+            // button is going to appear below the tiles — otherwise the same
+            // remediation hint reads twice (caption + button label). Users
+            // without a discoverable `claude` binary still get the raw text
+            // so they know the manual fix.
+            if err == UsageFetcher.claudeReauthRequiredMessage,
+               UsageFetcher.canPromptClaudeReauth() {
+                return ""
+            }
+            return err
+        }
         return ""
     }
 }

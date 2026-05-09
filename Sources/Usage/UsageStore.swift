@@ -11,8 +11,15 @@ final class UsageStore: ObservableObject {
     @Published var codex: AppUsage = .empty
     @Published var lastUpdated: Date?
     @Published var loading = false
+    /// Set while a `claude auth login` flow is in progress (spawned + still
+    /// polling for the keychain to update). The UI hides the re-auth button
+    /// during this window so users don't double-tap and spawn duplicate CLI
+    /// processes; the click ends up no-ops anyway because the spawn check
+    /// gates on this.
+    @Published var claudeReauthInProgress = false
 
     private var refreshTask: Task<Void, Never>?
+    private var reauthPollTask: Task<Void, Never>?
     private var pollTimer: Timer?
     private var intervalCancellable: AnyCancellable?
     private var netMonitor: NWPathMonitor?
@@ -143,6 +150,40 @@ final class UsageStore: ObservableObject {
             plan: codex.plan ?? "pro"
         )
         self.lastUpdated = now
+    }
+
+    /// Spawn `claude auth login` and poll for the keychain to update.
+    ///
+    /// We can't `await` the OAuth flow directly — it happens in a separate
+    /// process that owns a browser tab and a localhost listener — so we kick
+    /// off retries every few seconds and stop as soon as one returns success
+    /// (or after a generous deadline so the button doesn't stay disabled
+    /// forever if the user closes the browser without completing).
+    func reauthenticateClaude() {
+        guard !claudeReauthInProgress else { return }
+        guard UsageFetcher.spawnClaudeReauth() else { return }
+        claudeReauthInProgress = true
+        reauthPollTask?.cancel()
+        reauthPollTask = Task { [weak self] in
+            // ~2 minutes total — generous enough that even a slow OAuth
+            // round-trip (browser cold start, SSO redirect, 2FA prompt)
+            // resolves in time, short enough to not strand the UI.
+            for _ in 0..<24 {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                if Task.isCancelled { return }
+                let cl = await UsageFetcher.fetchClaude()
+                if Task.isCancelled { return }
+                if cl.fiveHour.error == nil || cl.weekly.error == nil {
+                    await MainActor.run {
+                        self?.claude = cl
+                        self?.lastUpdated = Date()
+                        self?.claudeReauthInProgress = false
+                    }
+                    return
+                }
+            }
+            await MainActor.run { self?.claudeReauthInProgress = false }
+        }
     }
 
     func startAutoRefresh() {
