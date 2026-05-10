@@ -238,8 +238,18 @@ struct PerModelCostBreakdown: View {
     /// fourth-and-beyond model that burned real dollars would silently
     /// disappear from the sum and the footer figure would diverge from
     /// the cost-page Today figure (when today equals last 5h).
+    ///
+    /// Re-sorted by dollars descending. The upstream `recentByModel`
+    /// orders by tokens (correct for the usage page), but on the cost
+    /// page that's wrong: a cache-heavy model with low billable tokens
+    /// but high spend would drop out of the displayed top-3 in favor of
+    /// a high-token / pennies-of-spend model. Sorting by dollars puts
+    /// the dollars-dominant row at index 0 so the row-weight tapering
+    /// (`perModelRowWeights[0] = 0.85`) actually emphasizes the
+    /// biggest-spend row.
     private var allRows: [ModelUsageRow] {
         recentRows(for: provider, store: costStore)
+            .sorted { $0.dollars > $1.dollars }
     }
     private var displayedRows: [ModelUsageRow] {
         Array(allRows.prefix(perModelRowLimit))
