@@ -8,7 +8,7 @@ struct IslandRootView: View {
     @State private var pillsVisible = false
     @State private var pulseToken: UUID?
 
-    /// PNG-from-disk decode is ~150µs per call. Computed properties
+    /// Image decode from disk is ~150µs per call. Computed properties
     /// re-decoded both logos every render — inside a 120Hz TimelineView
     /// that's 240 main-thread decodes/sec. Cache once on appear.
     @State private var claudeLogo: NSImage?
